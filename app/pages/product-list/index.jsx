@@ -1,0 +1,736 @@
+/*
+ * Copyright (c) 2021, salesforce.com, inc.
+ * All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ * For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
+ */
+
+import React, {useEffect, useState} from 'react'
+import PropTypes from 'prop-types'
+import {useHistory, useParams} from 'react-router-dom'
+import {FormattedMessage, useIntl} from 'react-intl'
+import {Helmet} from 'react-helmet'
+
+// Components
+import {
+    Box,
+    Flex,
+    SimpleGrid,
+    Grid,
+    Select,
+    Text,
+    FormControl,
+    Stack,
+    useDisclosure,
+    Button,
+    Modal,
+    ModalHeader,
+    ModalBody,
+    ModalFooter,
+    ModalContent,
+    ModalCloseButton,
+    ModalOverlay,
+    Drawer,
+    DrawerBody,
+    DrawerHeader,
+    DrawerOverlay,
+    DrawerContent,
+    DrawerCloseButton,
+    Link
+} from '@chakra-ui/react'
+
+// Project Components
+import Pagination from '../../components/pagination'
+import ProductTile, {Skeleton as ProductTileSkeleton} from '../../components/product-tile'
+// import ProductList from './components/project/product-list'
+import {HideOnDesktop} from '../../components/responsive'
+import Refinements from './partials/refinements'
+import SelectedRefinements from './partials/selected-refinements'
+import EmptySearchResults from './partials/empty-results'
+import PageHeader from './partials/page-header'
+import Seo from '../../components/seo'
+
+// Icons
+import {FilterIcon, ChevronDownIcon} from '../../components/icons'
+
+// Hooks
+import {useLimitUrls, usePageUrls, useSortUrls, useSearchParams} from '../../hooks'
+import {useToast} from '../../hooks/use-toast'
+import useWishlist from '../../hooks/use-wishlist'
+import {parse as parseSearchParams} from '../../hooks/use-search-params'
+import {useCategories} from '../../hooks/use-categories'
+
+// Others
+import {HTTPNotFound} from 'pwa-kit-react-sdk/ssr/universal/errors'
+
+// Constants
+import {DEFAULT_LIMIT_VALUES, API_ERROR_MESSAGE} from '../../constants'
+import useNavigation from '../../hooks/use-navigation'
+import LoadingSpinner from '../../components/loading-spinner'
+
+// NOTE: You can ignore certain refinements on a template level by updating the below
+// list of ignored refinements.
+const REFINEMENT_DISALLOW_LIST = ['c_isNew']
+
+/*
+ * This is a simple product listing page. It displays a paginated list
+ * of product hit objects. Allowing for sorting and filtering based on the
+ * allowable filters and sort refinements.
+ */
+const ProductList = (props) => {
+    const {
+        searchQuery,
+        productSearchResult,
+        // eslint-disable-next-line react/prop-types
+        staticContext,
+        location,
+        isLoading,
+        ...rest
+    } = props
+    const {total, sortingOptions} = productSearchResult || {}
+
+    const {isOpen, onOpen, onClose} = useDisclosure()
+    const [sortOpen, setSortOpen] = useState(false)
+    const {formatMessage} = useIntl()
+    const navigate = useNavigation()
+    const history = useHistory()
+    const params = useParams()
+    const {categories} = useCategories()
+    const toast = useToast()
+
+    // Get the current category from global state.
+    let category = undefined
+    if (!searchQuery) {
+        category = categories[params.categoryId]
+    }
+
+    const basePath = `${location.pathname}${location.search}`
+    // Reset scroll position when `isLoaded` becomes `true`.
+    useEffect(() => {
+        isLoading && window.scrollTo(0, 0)
+        setFiltersLoading(isLoading)
+    }, [isLoading])
+
+    // Get urls to be used for pagination, page size changes, and sorting.
+    const pageUrls = usePageUrls({total})
+    const sortUrls = useSortUrls({options: sortingOptions})
+    const limitUrls = useLimitUrls()
+
+    // If we are loaded and still have no products, show the no results component.
+    const showNoResults = !isLoading && productSearchResult && !productSearchResult?.hits
+
+    /**************** Wishlist ****************/
+    const wishlist = useWishlist()
+    // keep track of the items has been add/remove to/from wishlist
+    const [wishlistLoading, setWishlistLoading] = useState([])
+    const addItemToWishlist = async (product) => {
+        try {
+            setWishlistLoading([...wishlistLoading, product.productId])
+            await wishlist.createListItem({
+                id: product.productId,
+                quantity: 1
+            })
+            toast({
+                title: formatMessage(
+                    {
+                        id: 'product_list.info.added_to_wishlist',
+                        defaultMessage:
+                            '{quantity} {quantity, plural, one {item} other {items}} added to wishlist'
+                    },
+                    {quantity: 1}
+                ),
+                status: 'success',
+                action: (
+                    // it would be better if we could use <Button as={Link}>
+                    // but unfortunately the Link component is not compatible
+                    // with Chakra Toast, since the ToastManager is rendered via portal
+                    // and the toast doesn't have access to intl provider, which is a
+                    // requirement of the Link component.
+                    <Button variant="link" onClick={() => navigate('/account/wishlist')}>
+                        View
+                    </Button>
+                )
+            })
+        } catch {
+            toast({
+                title: formatMessage(API_ERROR_MESSAGE),
+                status: 'error'
+            })
+        } finally {
+            setWishlistLoading(wishlistLoading.filter((id) => id !== product.productId))
+        }
+    }
+    const removeItemFromWishlist = async (product) => {
+        try {
+            setWishlistLoading([...wishlistLoading, product.productId])
+            await wishlist.removeListItemByProductId(product.productId)
+            toast({
+                title: formatMessage({
+                    id: 'product_list.info.removed_from_wishlist',
+                    defaultMessage: 'Item removed from wishlist'
+                }),
+                status: 'success'
+            })
+        } catch {
+            toast({
+                title: formatMessage(API_ERROR_MESSAGE),
+                status: 'error'
+            })
+        } finally {
+            setWishlistLoading(wishlistLoading.filter((id) => id !== product.productId))
+        }
+    }
+
+    /**************** Filters ****************/
+    const [searchParams, {stringify: stringifySearchParams}] = useSearchParams()
+    const [filtersLoading, setFiltersLoading] = useState(false)
+
+    // Toggles filter on and off
+    const toggleFilter = (value, attributeId, selected, allowMultiple = true) => {
+        const searchParamsCopy = {...searchParams}
+
+        // Remove the `offset` search param if present.
+        delete searchParamsCopy.offset
+
+        // If we aren't allowing for multiple selections, simply clear any value set for the
+        // attribute, and apply a new one if required.
+        if (!allowMultiple) {
+            delete searchParamsCopy.refine[attributeId]
+
+            if (!selected) {
+                searchParamsCopy.refine[attributeId] = value.value
+            }
+        } else {
+            // Get the attibute value as an array.
+            let attributeValue = searchParamsCopy.refine[attributeId] || []
+            let values = Array.isArray(attributeValue) ? attributeValue : attributeValue.split('|')
+
+            // Either set the value, or filter the value out.
+            if (!selected) {
+                values.push(value.value)
+            } else {
+                values = values?.filter((v) => v !== value.value)
+            }
+
+            // Update the attribute value in the new search params.
+            searchParamsCopy.refine[attributeId] = values
+
+            // If the update value is an empty array, remove the current attribute key.
+            if (searchParamsCopy.refine[attributeId].length === 0) {
+                delete searchParamsCopy.refine[attributeId]
+            }
+        }
+
+        navigate(`/category/${params.categoryId}?${stringifySearchParams(searchParamsCopy)}`)
+    }
+
+    // Clears all filters
+    const resetFilters = () => {
+        navigate(window.location.pathname)
+    }
+
+    let selectedSortingOptionLabel = productSearchResult?.sortingOptions?.find(
+        (option) => option.id === productSearchResult?.selectedSortingOption
+    )
+
+    // API does not always return a selected sorting order
+    if (!selectedSortingOptionLabel) {
+        selectedSortingOptionLabel = productSearchResult?.sortingOptions?.[0]
+    }
+
+    return (
+        <Box
+            className="sf-product-list-page"
+            data-testid="sf-product-list-page"
+            layerStyle="page"
+            maxWidth="1280px"
+            px="0px"
+            paddingTop={{base: 0, lg: 8}}
+            paddingBottom={{base: 4, lg: 8}}
+            {...rest}
+        >
+            <Box
+                className="sf-product-list-category-banner"
+                data-testid="sf-product-list-category-banner"
+                position="relative"
+                layerStyle="page"
+                backgroundColor="#1B321E"
+                py={{base: '175px', lg: '155px'}}
+                marginBottom={{base: '0px', lg: '30px'}}
+                {...rest}
+            >
+                <Box
+                    className="catlanding-banner main-banner-content absolute-wrapper"
+                    color="#FFFFFF"
+                    position="absolute"
+                    width="100%"
+                    top="50%"
+                    left="50%"
+                    transform="translate(-50%, -50%)"
+                    textAlign="center"
+                >
+                    <Text
+                        className="mainTitle"
+                        fontSize={{base: '36px', lg: '60px'}}
+                        style={{
+                            textTransform: 'uppercase',
+                            fontFamily: 'Five Year Later'
+                        }}
+                    >
+                        products about your care
+                    </Text>
+                    <Text
+                        className="secondary-title"
+                        fontSize={{base: '20px', lg: '22px'}}
+                        px={{base: '30px', lg: '0px'}}
+                        style={{
+                            fontFamily: 'FK Grotesk Regular',
+                            marginBottom: '20px'
+                        }}
+                    >
+                        {category.description}
+                    </Text>
+                </Box>
+            </Box>
+            <Helmet>
+                {/* <title>{category?.pageTitle}</title> */}
+                <title>Product List | CosmeticsForYou</title>
+                <meta name="description" content={category?.pageDescription} />
+                <meta name="keywords" content={category?.pageKeywords} />
+            </Helmet>
+            {showNoResults ? (
+                <EmptySearchResults searchQuery={searchQuery} category={category} />
+            ) : (
+                <>
+                    {/* Header */}
+
+                    <Stack
+                        display={{base: 'none', lg: 'flex'}}
+                        direction="row"
+                        justify="flex-start"
+                        align="flex-start"
+                        spacing={4}
+                        marginBottom={6}
+                    >
+                        <Flex align="left" width="287px">
+                            <PageHeader
+                                searchQuery={searchQuery}
+                                category={category}
+                                productSearchResult={productSearchResult}
+                                isLoading={isLoading}
+                            />
+                        </Flex>
+
+                        <Box flex={1} paddingTop={'45px'}>
+                            <SelectedRefinements
+                                filters={productSearchResult?.refinements}
+                                toggleFilter={toggleFilter}
+                                selectedFilterValues={productSearchResult?.selectedRefinements}
+                            />
+                        </Box>
+                    </Stack>
+
+                    <HideOnDesktop>
+                        <Stack spacing={6}>
+                            <PageHeader
+                                searchQuery={searchQuery}
+                                category={category}
+                                productSearchResult={productSearchResult}
+                                isLoading={isLoading}
+                            />
+                            <Stack
+                                display={{base: 'flex', md: 'none'}}
+                                direction="row"
+                                justify="center"
+                                align="center"
+                                spacing={1}
+                                height={12}
+                                marginTop={0}
+                                borderColor="gray.100"
+                            >
+                                <Flex align="center">
+                                    <Button
+                                        fontSize="sm"
+                                        colorScheme="black"
+                                        variant="outline"
+                                        marginRight={2}
+                                        display="inline-flex"
+                                        leftIcon={<FilterIcon boxSize={5} />}
+                                        onClick={onOpen}
+                                    >
+                                        <FormattedMessage
+                                            defaultMessage="Filter"
+                                            id="product_list.button.filter"
+                                        />
+                                    </Button>
+                                </Flex>
+                                <Flex align="center">
+                                    <Button
+                                        maxWidth="245px"
+                                        fontSize="sm"
+                                        marginRight={2}
+                                        colorScheme="black"
+                                        variant="outline"
+                                        display="inline-flex"
+                                        rightIcon={<ChevronDownIcon boxSize={5} />}
+                                        onClick={() => setSortOpen(true)}
+                                    >
+                                        {formatMessage(
+                                            {
+                                                id: 'product_list.button.sort_by',
+                                                defaultMessage: 'Sort'
+                                                // defaultMessage: 'Sort By: {sortOption}'
+                                            },
+                                            {
+                                                sortOption: selectedSortingOptionLabel?.label
+                                            }
+                                        )}
+                                    </Button>
+                                </Flex>
+                            </Stack>
+                        </Stack>
+                        <Box marginBottom={4}>
+                            <SelectedRefinements
+                                filters={productSearchResult?.refinements}
+                                toggleFilter={toggleFilter}
+                                selectedFilterValues={productSearchResult?.selectedRefinements}
+                            />
+                        </Box>
+                    </HideOnDesktop>
+
+                    {/* Body  */}
+                    <Grid templateColumns={{base: '1fr', md: '280px 1fr'}} columnGap={6}>
+                        <Stack display={{base: 'none', md: 'flex'}}>
+                            <Refinements
+                                isLoading={filtersLoading}
+                                toggleFilter={toggleFilter}
+                                filters={productSearchResult?.refinements}
+                                selectedFilters={searchParams.refine}
+                            />
+                        </Stack>
+
+                        <Box mx={{base: '15px', md: 0}}>
+                            <SimpleGrid
+                                columns={[2, 2, 3, 3]}
+                                spacingX={4}
+                                spacingY={{base: 12, lg: 16}}
+                            >
+                                {isLoading || !productSearchResult
+                                    ? new Array(searchParams.limit)
+                                          .fill(0)
+                                          .map((value, index) => (
+                                              <ProductTileSkeleton key={index} />
+                                          ))
+                                    : productSearchResult.hits.map((productSearchItem) => {
+                                          const productId = productSearchItem.productId
+                                          const isInWishlist = !!wishlist.findItemByProductId(
+                                              productId
+                                          )
+
+                                          return (
+                                              <ProductTile
+                                                  data-testid={`sf-product-tile-${productSearchItem.productId}`}
+                                                  key={productSearchItem.productId}
+                                                  product={productSearchItem}
+                                                  mx={{base: 0, md: '40px'}}
+                                                  enableFavourite={true}
+                                                  isFavourite={isInWishlist}
+                                                  onFavouriteToggle={(isFavourite) => {
+                                                      const action = isFavourite
+                                                          ? addItemToWishlist
+                                                          : removeItemFromWishlist
+                                                      return action(productSearchItem)
+                                                  }}
+                                                  dynamicImageProps={{
+                                                      widths: [
+                                                          '50vw',
+                                                          '50vw',
+                                                          '20vw',
+                                                          '20vw',
+                                                          '25vw'
+                                                      ]
+                                                  }}
+                                              />
+                                          )
+                                      })}
+                            </SimpleGrid>
+                            <Box
+                                className="search-result-options footer-result-options"
+                                display="flex"
+                                justifyContent="center"
+                                my="10px"
+                                fontSize={{base: '13px', md: '14px'}}
+                                color="#695a5d"
+                            >
+                                {/* Switch to FormattedMessage */}
+                                <Text
+                                    width="100%"
+                                    sx={{
+                                        textAlign: 'center',
+                                        borderBottom: '1px solid #000',
+                                        lineHeight: '0.1em',
+                                        margin: '10px 0 20px'
+                                    }}
+                                >
+                                    <Text as="span" background="#fff" px="10px" py="0px">
+                                        {productSearchResult?.total} Items
+                                    </Text>
+                                </Text>
+                            </Box>
+                            {/* Footer */}
+                            <Flex justifyContent="center" paddingTop={8}>
+                                <Pagination currentURL={basePath} urls={pageUrls} />
+
+                                {/*
+                            Our design doesn't call for a page size select. Show this element if you want
+                            to add one to your design.
+                        */}
+                                <Select
+                                    display="none"
+                                    value={basePath}
+                                    onChange={({target}) => {
+                                        history.push(target.value)
+                                    }}
+                                >
+                                    {limitUrls.map((href, index) => (
+                                        <option key={href} value={href}>
+                                            {DEFAULT_LIMIT_VALUES[index]}
+                                        </option>
+                                    ))}
+                                </Select>
+                            </Flex>
+                        </Box>
+                    </Grid>
+                </>
+            )}
+            <Modal
+                isOpen={isOpen}
+                onClose={onClose}
+                size="full"
+                motionPreset="slideInBottom"
+                scrollBehavior="inside"
+            >
+                <ModalOverlay />
+                <ModalContent top={0} marginTop={0}>
+                    <ModalHeader>
+                        <Text fontWeight="bold" fontSize="2xl">
+                            <FormattedMessage
+                                defaultMessage="Filter"
+                                id="product_list.modal.title.filter"
+                            />
+                        </Text>
+                    </ModalHeader>
+                    <ModalCloseButton />
+                    <ModalBody py={4}>
+                        {filtersLoading && <LoadingSpinner />}
+                        <Refinements
+                            toggleFilter={toggleFilter}
+                            filters={productSearchResult?.refinements}
+                            selectedFilters={productSearchResult?.selectedRefinements}
+                        />
+                    </ModalBody>
+
+                    <ModalFooter
+                        // justify="space-between"
+                        display="block"
+                        width="full"
+                        borderTop="1px solid"
+                        borderColor="gray.100"
+                        paddingBottom={10}
+                    >
+                        <Stack>
+                            <Button width="full" onClick={onClose}>
+                                {formatMessage(
+                                    {
+                                        id: 'product_list.modal.button.view_items',
+                                        defaultMessage: 'View {productCount} items'
+                                    },
+                                    {
+                                        productCount: productSearchResult?.total
+                                    }
+                                )}
+                            </Button>
+                            <Button width="full" variant="outline" onClick={() => resetFilters()}>
+                                <FormattedMessage
+                                    defaultMessage="Clear Filters"
+                                    id="product_list.modal.button.clear_filters"
+                                />
+                            </Button>
+                        </Stack>
+                    </ModalFooter>
+                </ModalContent>
+            </Modal>
+            <Drawer
+                placement="bottom"
+                isOpen={sortOpen}
+                onClose={() => setSortOpen(false)}
+                size="sm"
+                motionPreset="slideInBottom"
+                scrollBehavior="inside"
+                isFullHeight={false}
+                height="50%"
+            >
+                <DrawerOverlay />
+                <DrawerContent marginTop={0}>
+                    <DrawerHeader boxShadow="none">
+                        <Text fontWeight="bold" fontSize="2xl">
+                            <FormattedMessage
+                                defaultMessage="Sort By"
+                                id="product_list.drawer.title.sort_by"
+                            />
+                        </Text>
+                    </DrawerHeader>
+                    <DrawerCloseButton />
+                    <DrawerBody>
+                        {sortUrls.map((href, idx) => (
+                            <Button
+                                width="full"
+                                onClick={() => {
+                                    setSortOpen(false)
+                                    history.push(href)
+                                }}
+                                fontSize={'md'}
+                                key={idx}
+                                marginTop={0}
+                                variant="menu-link"
+                            >
+                                <Text
+                                    as={
+                                        selectedSortingOptionLabel?.label ===
+                                            productSearchResult?.sortingOptions[idx]?.label && 'u'
+                                    }
+                                >
+                                    {productSearchResult?.sortingOptions[idx]?.label}
+                                </Text>
+                            </Button>
+                        ))}
+                    </DrawerBody>
+                </DrawerContent>
+            </Drawer>
+        </Box>
+    )
+}
+
+ProductList.getTemplateName = () => 'product-list'
+
+ProductList.shouldGetProps = ({previousLocation, location}) =>
+    !previousLocation ||
+    previousLocation.pathname !== location.pathname ||
+    previousLocation.search !== location.search
+
+ProductList.getProps = async ({res, params, location, api}) => {
+    const {categoryId} = params
+    const urlParams = new URLSearchParams(location.search)
+    let searchQuery = urlParams.get('q')
+    let isSearch = false
+
+    if (searchQuery) {
+        isSearch = true
+    }
+    // In case somebody navigates to /search without a param
+    if (!categoryId && !isSearch) {
+        // We will simulate search for empty string
+        return {searchQuery: ' ', productSearchResult: {}}
+    }
+
+    const searchParams = parseSearchParams(location.search, false)
+
+    if (!searchParams.refine.includes(`cgid=${categoryId}`) && categoryId) {
+        searchParams.refine.push(`cgid=${categoryId}`)
+    }
+
+    // only search master products
+    searchParams.refine.push('htype=master')
+
+    // Set the `cache-control` header values to align with the Commerce API settings.
+    if (res) {
+        res.set('Cache-Control', 'public, must-revalidate, max-age=900')
+    }
+
+    const [category, productSearchResult] = await Promise.all([
+        isSearch
+            ? Promise.resolve()
+            : api.shopperProducts.getCategory({
+                  parameters: {id: categoryId, levels: 0}
+              }),
+        api.shopperSearch.productSearch({
+            parameters: searchParams
+        })
+    ])
+
+    // Apply disallow list to refinements.
+    productSearchResult.refinements = productSearchResult?.refinements?.filter(
+        ({attributeId}) => !REFINEMENT_DISALLOW_LIST.includes(attributeId)
+    )
+
+    // The `isomorphic-sdk` returns error objects when they occur, so we
+    // need to check the category type and throw if required.
+    if (category?.type?.endsWith('category-not-found')) {
+        throw new HTTPNotFound(category.detail)
+    }
+
+    return {searchQuery: searchQuery, productSearchResult}
+}
+
+ProductList.propTypes = {
+    /**
+     * The search result object showing all the product hits, that belong
+     * in the supplied category.
+     */
+    productSearchResult: PropTypes.object,
+    /*
+     * Indicated that `getProps` has been called but has yet to complete.
+     *
+     * Notes: This prop is internally provided.
+     */
+    isLoading: PropTypes.bool,
+    /*
+     * Object that represents the current location, it consists of the `pathname`
+     * and `search` values.
+     *
+     * Notes: This prop is internally provided.
+     */
+    location: PropTypes.object,
+    searchQuery: PropTypes.string,
+    onAddToWishlistClick: PropTypes.func,
+    onRemoveWishlistClick: PropTypes.func
+}
+
+export default ProductList
+
+const Sort = ({sortUrls, productSearchResult, basePath, ...otherProps}) => {
+    const intl = useIntl()
+    const history = useHistory()
+
+    return (
+        <FormControl data-testid="sf-product-list-sort" id="page_sort" width="auto" {...otherProps}>
+            <Select
+                value={basePath.replace(/(offset)=(\d+)/i, '$1=0')}
+                onChange={({target}) => {
+                    history.push(target.value)
+                }}
+                height={11}
+                width="240px"
+            >
+                {/* {sortUrls.map((href, index) => (
+                    <option key={href} value={href}>
+                        {intl.formatMessage(
+                            {
+                                id: 'product_list.select.sort_by',
+                                defaultMessage: 'Sort By: {sortOption}'
+                            },
+                            {
+                                sortOption: productSearchResult?.sortingOptions[index]?.label
+                            }
+                        )}
+                    </option>
+                ))} */}
+            </Select>
+        </FormControl>
+    )
+}
+Sort.propTypes = {
+    sortUrls: PropTypes.array,
+    productSearchResult: PropTypes.object,
+    basePath: PropTypes.string
+}
